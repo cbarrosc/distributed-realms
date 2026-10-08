@@ -102,21 +102,24 @@ Un identificador de transporte SQS no sustituye a `messageId` ni a `rewardId`. R
 
 Se conserva mediante una etiqueta Git, junto con instrucciones y herramientas que permitan reproducir el fallo.
 
-La implementación confirma la escritura de negocio y luego publica el mensaje en una operación separada. No tiene un registro durable de publicaciones pendientes ni un recuperador de esas publicaciones. No se le atribuyen garantías frente a duplicados.
+La primera iteración debe ser una implementación razonable, vulnerable únicamente en las garantías que se estudian. Incluye validación de contratos, idempotencia de negocio por rewardId, protección condicional de transiciones, persistencia atómica local y confirmación del mensaje de entrada después de procesarlo y publicar el resultado. No confirma anticipadamente mensajes ni omite controles básicos para fabricar un fallo.
 
-Punto de fallo principal: Hero termina de guardar XP y se detiene antes de enviar `ExperienceGranted`.
+Su vulnerabilidad es la doble escritura: el estado de negocio y el envío a SQS se confirman por separado, sin outbox durable. Cada entrada de recompensa procesada conserva el resultado de negocio, pero no representa una publicación pendiente ni dispone de un proceso que la recupere. En una reentrega de una operación ya aplicada, el consumidor reconoce el duplicado y confirma la entrada sin volver a publicar su resultado. Este comportamiento evita repetir el efecto local, pero deja una brecha entre idempotencia local y recuperación del flujo distribuido.
 
-Resultado esperado:
+El experimento principal controla la siguiente secuencia:
 
-- La XP está persistida.
-- Quest permanece en `XP_PENDING`.
-- Inventory no ha entregado el objeto.
-- Reiniciar Hero no garantiza completar la recompensa.
+1. Hero recibe `GrantExperience` y confirma una transacción local que incrementa XP y registra rewardId como procesado.
+2. Una barrera registra `BUSINESS_COMMITTED_BEFORE_RESULT_PUBLICATION` y detiene el flujo antes de publicar `ExperienceGranted` y antes de confirmar el comando de entrada.
+3. El operador termina Hero, deja expirar el visibility timeout y lo reinicia con la interrupción desactivada.
+4. Se verifica la reentrega del comando. Hero reconoce rewardId como procesado, no vuelve a conceder XP y confirma el mensaje sin emitir el resultado ausente.
 
-Se registrará si el mensaje original sigue pendiente, se reentrega o ya fue confirmado. Una reentrega puede cambiar el resultado, incluso duplicar XP; por ello la ventana de pérdida debe reproducirse con confirmación del comando después de persistir y antes de publicar el resultado, o con otra secuencia controlada equivalente documentada. La herramienta de fallo debe dejar inequívoca la secuencia observada.
+Resultado esperado: una sola concesión de XP, Quest en `XP_PENDING`, ningún objeto entregado y ninguna publicación de `ExperienceGranted` originada por este comando. La reentrega ya no es una contingencia que invalida el experimento: es parte obligatoria de la demostración. Se registran commit, barrera, reentrega, detección del duplicado y confirmación, con rewardId y messageId.
 
-Esta versión es deliberadamente vulnerable y no constituye la base de garantías de la versión siguiente.
+La prueba usa barreras y condiciones observables, con un plazo acotado para comprobar la reentrega; no depende de acertar una ventana por tiempo ni pretende probar ausencia eterna de mensajes. Si no se observa la reentrega, el experimento queda inconcluso. Las reentregas adicionales tampoco deben reparar el resultado ausente bajo esta política.
 
+Una política alternativa que vuelva a publicar el resultado al detectar una operación procesada puede recuperar esta ventana si conserva suficiente información. Se discutirá como comparación explícita: no se atribuye la pérdida a toda implementación sin outbox, sino a la combinación concreta de doble escritura y supresión de duplicados sin republicación. La versión vulnerable documenta esa decisión y sus límites.
+
+La versión recuperable conserva los controles de esta primera iteración y añade el registro transaccional y la recuperación de publicaciones pendientes. La comparación debe aislar esa mejora, sin cambiar reglas de negocio ni eliminar controles de la primera versión.
 ## 7. Versión recuperable: lab-02-recoverable
 
 Mantiene el mismo caso de negocio y contratos para repetir los experimentos con garantías adicionales.
@@ -133,6 +136,13 @@ La escritura usa condiciones que impiden aplicar dos veces una operación concur
 
 Un publicador recuperable envía las entradas pendientes de la outbox y registra su publicación después del envío. Puede publicar dos veces si cae entre enviar y registrar el resultado; los consumidores deben tolerarlo. Su selección de pendientes, coordinación y política de reintentos se concretarán en el plan de implementación.
 
+### Publicadores concurrentes
+
+Dos workers pueden seleccionar la misma entrada pendiente. La corrección no puede depender de ejecutar un único publicador. El contrato mínimo permite envíos repetidos de la misma entrada, siempre conservando su `messageId` y contenido, y exige que no se pierdan pendientes ni se marquen como publicados antes de un envío exitoso.
+
+El experimento sincroniza dos workers después de seleccionar la misma entrada y antes de enviarla. Ambos se liberan mediante una barrera; se registran selección, intento, respuesta del envío y actualización de estado por worker. Se comprueba que los duplicados no generan otro efecto de negocio ni otra transición de saga y que el estado de publicación converge. Se repite deteniendo un worker después de enviar y antes de registrar la publicación.
+
+Una reclamación condicional con lease puede reducir envíos simultáneos; no elimina duplicados cuando un envío ya ocurrió o un worker sigue trabajando después de expirar su lease. Si el plan adopta leases, debe definir propietario, vencimiento y actualización condicional por propietario, y añadir un caso de recuperación de una reclamación abandonada. No se atribuye exclusividad al transporte ni entrega exactamente una vez a este mecanismo.
 ### Idempotencia y transiciones
 
 - Hero reconoce `GrantExperience` por `rewardId` y no suma XP otra vez.
@@ -142,6 +152,15 @@ Un publicador recuperable envía las entradas pendientes de la outbox y registra
 - Los resultados procesados y registros de deduplicación se conservan durante el laboratorio; no se introduce TTL que permita duplicar una recompensa antigua.
 - Repetir la solicitud HTTP con el mismo `rewardId` y contenido devuelve la recompensa existente.
 
+Se distinguen tres protecciones independientes:
+
+| Protección | Identidad o condición | Qué impide |
+| --- | --- | --- |
+| Deduplicación de mensajes | `messageId` | Procesar otra vez el mismo mensaje lógico |
+| Idempotencia de negocio | `rewardId` y operación | Conceder dos veces XP o entregar dos veces el objeto, incluso con messageId distintos |
+| Protección de transición | Estado esperado y versión persistida de saga | Avanzar dos veces o retroceder por resultados duplicados, tardíos o concurrentes |
+
+Ejemplo obligatorio: dos `ExperienceGranted` con messageId distintos y el mismo rewardId llegan a Quest. Solo la transición condicional `XP_PENDING -> ITEM_PENDING` puede crear el comando lógico `DeliverItem`. El cambio de estado y la creación de su entrada de outbox se confirman juntos. Si Quest ya está en `ITEM_PENDING` o `COMPLETED`, el segundo evento compatible no crea otra entrada. Un resultado con contenido contradictorio o incompatible con el estado debe registrarse como anomalía y tratarse explícitamente, sin avanzar silenciosamente la saga.
 No se promete entrega de transporte exactamente una vez. Se busca que las reentregas produzcan un único efecto de negocio.
 
 ### Recuperación y observabilidad
@@ -157,10 +176,13 @@ Cada ejecución parte de datos identificables y registra el estado inicial. Se u
 | Experimento | Comprobación |
 | --- | --- |
 | Flujo sin fallos | Saga completa, incremento esperado de XP y un objeto asociado a rewardId |
-| Caída de Hero después de persistir XP y antes de publicar | Versión vulnerable muestra pérdida o duplicación según la secuencia documentada; versión recuperable publica lo pendiente al reiniciar |
+| Caída después del commit local y antes de publicar y confirmar entrada | Reentrega obligatoria: vulnerable suprime el duplicado sin republicar y queda pendiente; recuperable publica desde outbox y completa |
+| Reentrega de comando ya aplicado | Ambas versiones conservan una sola concesión de XP y un solo objeto; se compara recuperación del resultado ausente |
 | Caída después de publicar y antes de marcar outbox | Puede repetirse el mensaje, pero no su efecto de negocio |
-| Comando duplicado, también concurrente | En versión recuperable hay una concesión de XP y un objeto |
-| Resultado duplicado o tardío | Quest no repite pasos ni retrocede de estado |
+| Comando duplicado, también concurrente | En ambas versiones hay una concesión de XP y un objeto |
+| Resultado duplicado o tardío, con messageId iguales y distintos | Una transición válida y una entrada lógica DeliverItem; también ante procesamiento concurrente |
+| Dos publicadores seleccionan la misma entrada | Barrera fuerza la carrera; se conservan identidad y contenido, no se pierde el pendiente y no se duplica el efecto |
+| Un publicador concurrente cae después del envío | Otro worker puede completar o repetir la publicación; saga y efectos permanecen únicos |
 | Reinicio de Quest durante la saga | Continúa desde el estado persistido sin depender de memoria local |
 | Inventory fuera de servicio | XP permanece concedida; al recuperarse Inventory, se entrega el objeto y completa la saga |
 
@@ -197,3 +219,96 @@ Se conservan como temas de exploración, fuera del primer laboratorio:
 - [ ] Versión recuperable implementada y experimentos verificados.
 
 Todavía no existe código de producto ni infraestructura ejecutable en este repositorio.
+
+## 12. Arquitectura C4
+
+Los diagramas C4 complementan el flujo de mensajes: muestran los límites del sistema, los procesos ejecutables y las responsabilidades internas. Describen el diseño objetivo de la versión recuperable; no indican que exista implementación.
+
+### Nivel 1: contexto del sistema
+
+Floci es infraestructura local del laboratorio, representada en el nivel de contenedores. En este nivel se muestra la relación del operador con el sistema completo.
+
+```mermaid
+C4Context
+    title Distributed Realms - Contexto
+    Person(operator, "Operador", "Ejecuta experimentos, provoca fallos y comprueba garantías")
+    System(realms, "Distributed Realms", "Laboratorio de consistencia y recuperación mediante recompensas distribuidas")
+    Rel(operator, realms, "Inicia recompensas, consulta estados y ejecuta experimentos", "HTTP y herramientas locales")
+```
+
+### Nivel 2: contenedores
+
+Quest, Hero e Inventory son procesos independientes. Las tablas tienen propietarios distintos aunque residan en el mismo emulador. Las outboxes y los registros de operaciones procesadas pertenecen al servicio que los escribe.
+
+```mermaid
+C4Container
+    title Distributed Realms - Contenedores de la versión recuperable
+    Person(operator, "Operador", "Ejecuta y observa experimentos")
+    System_Boundary(realms, "Distributed Realms - laboratorio local") {
+        Container(quest, "Quest", "Spring Boot 4 / Java 25", "API de recompensas y coordinador persistente de saga")
+        Container(hero, "Hero", "Spring Boot 4 / Java 25", "Concesión idempotente de XP")
+        Container(inventory, "Inventory", "Spring Boot 4 / Java 25", "Entrega idempotente de objetos")
+        Boundary(floci, "Floci - emulador AWS") {
+            ContainerDb(questdb, "Persistencia Quest", "DynamoDB", "Sagas, mensajes procesados y outbox de Quest")
+            ContainerDb(herodb, "Persistencia Hero", "DynamoDB", "XP, recompensas procesadas y outbox de Hero")
+            ContainerDb(inventorydb, "Persistencia Inventory", "DynamoDB", "Objetos, recompensas procesadas y outbox de Inventory")
+            ContainerQueue(heroq, "hero-commands", "SQS Standard", "GrantExperience")
+            ContainerQueue(inventoryq, "inventory-commands", "SQS Standard", "DeliverItem")
+            ContainerQueue(resultsq, "quest-results", "SQS Standard", "ExperienceGranted e ItemDelivered")
+            ContainerQueue(dlqs, "DLQ por cola", "SQS", "Mensajes aislados para inspección y reprocesamiento")
+        }
+    }
+    Rel(operator, quest, "Inicia recompensas y consulta sagas", "HTTP / JSON")
+    Rel(operator, hero, "Consulta XP", "HTTP / JSON")
+    Rel(operator, inventory, "Consulta objetos", "HTTP / JSON")
+    Rel(quest, questdb, "Persiste transiciones y salida pendiente", "AWS SDK")
+    Rel(hero, herodb, "Persiste XP y salida pendiente", "AWS SDK")
+    Rel(inventory, inventorydb, "Persiste objetos y salida pendiente", "AWS SDK")
+    Rel(quest, heroq, "Publica comandos desde outbox", "SQS SendMessage")
+    Rel(heroq, hero, "Entrega comandos; Hero realiza polling", "SQS ReceiveMessage")
+    Rel(quest, inventoryq, "Publica comandos desde outbox", "SQS SendMessage")
+    Rel(inventoryq, inventory, "Entrega comandos; Inventory realiza polling", "SQS ReceiveMessage")
+    Rel(hero, resultsq, "Publica eventos desde outbox", "SQS SendMessage")
+    Rel(inventory, resultsq, "Publica eventos desde outbox", "SQS SendMessage")
+    Rel(resultsq, quest, "Entrega resultados; Quest realiza polling", "SQS ReceiveMessage")
+    Rel(heroq, dlqs, "Aísla mensajes tras agotar intentos", "Redrive policy")
+    Rel(inventoryq, dlqs, "Aísla mensajes tras agotar intentos", "Redrive policy")
+    Rel(resultsq, dlqs, "Aísla mensajes tras agotar intentos", "Redrive policy")
+```
+
+La caja de DLQ agrupa visualmente tres colas distintas. El operador también inspecciona tablas, colas y registros mediante herramientas del laboratorio; esos accesos operativos no forman parte de las APIs de negocio.
+
+### Nivel 3: componentes de Quest
+
+El coordinador decide transiciones y mensajes de salida. El repositorio confirma el cambio de saga, deduplicación y outbox en una transacción local. El publicador de outbox se ejecuta dentro del proceso Quest y puede recuperarse al reiniciar.
+
+```mermaid
+C4Component
+    title Quest - Componentes de la versión recuperable
+    Container_Boundary(quest, "Quest - Spring Boot 4 / Java 25") {
+        Component(api, "Reward API", "HTTP Controller", "Inicia recompensas y consulta su estado")
+        Component(listener, "Result Consumer", "SQS Listener", "Recibe resultados y confirma su procesamiento después del commit local")
+        Component(coordinator, "Reward Saga", "Application / Domain", "Valida rewardId y decide transiciones y comandos")
+        Component(repository, "Saga Repository", "DynamoDB Adapter", "Persiste saga, deduplicación y outbox de forma atómica")
+        Component(publisher, "Outbox Publisher", "Worker", "Publica pendientes y registra el envío; tolera reinicios")
+    }
+    ContainerDb(db, "Persistencia Quest", "DynamoDB en Floci", "Sagas, mensajes procesados y outbox")
+    ContainerQueue(results, "quest-results", "SQS en Floci", "Eventos de Hero e Inventory")
+    ContainerQueue(commands, "Colas de comandos", "SQS en Floci", "hero-commands e inventory-commands")
+    Rel(api, coordinator, "Solicita iniciar recompensa", "Java")
+    Rel(api, repository, "Consulta estado persistido", "Java")
+    Rel(results, listener, "Entrega eventos mediante polling", "AWS SDK")
+    Rel(listener, coordinator, "Solicita procesar resultado", "Java")
+    Rel(coordinator, repository, "Confirma transición y mensajes pendientes", "Java")
+    Rel(repository, db, "Escritura transaccional con condiciones", "DynamoDB TransactWriteItems")
+    Rel(publisher, db, "Lee pendientes y registra publicaciones", "AWS SDK")
+    Rel(publisher, commands, "Publica comandos; puede repetir el envío", "SQS SendMessage")
+```
+
+Hero e Inventory mantienen la misma separación entre consumidor, lógica de negocio, persistencia transaccional y publicador de outbox. Sus reglas de negocio son, respectivamente, conceder XP y entregar un objeto una sola vez por recompensa.
+
+### Diferencia arquitectónica de la versión vulnerable
+
+Los límites de procesos, las colas y la propiedad del estado se conservan. En `lab-01-vulnerable`, la aplicación persiste estado e idempotencia local y publica directamente, sin outbox durable. Las reentregas reconocidas como duplicados se confirman sin republicar el resultado. En `lab-02-recoverable`, los componentes de persistencia transaccional y publicación recuperable cierran esa ventana; no se requiere cambiar el contrato de negocio.
+
+El nivel 4 de C4 queda fuera de esta especificación: la estructura concreta del código se decidirá en el plan de implementación.
